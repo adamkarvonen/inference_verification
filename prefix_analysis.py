@@ -51,20 +51,6 @@ def compress_matrix_downproj(
 
 
 # ------------------------------------------------------------
-# Config
-# ------------------------------------------------------------
-DEVICE = torch.device("cuda")  # ← run on GPU
-ACTIVATION_DIR = Path("activations")
-# ACTIVATION_DIR = Path("activations_prefix_longer")
-FILES = {
-    "prefill16": "16bit_prefill_a.pkl",
-    "gen16": "16bit_generation.pkl",
-    "prefill8": "16bit_prefill_b.pkl",
-}
-K_VALUES: List[int] = [4, 32, 64, 128, 256]
-
-
-# ------------------------------------------------------------
 # Data loading
 # ------------------------------------------------------------
 def load_activation_sequences(
@@ -119,7 +105,10 @@ def batched_negative_l2(
 # Collect per-token scores & labels
 # ------------------------------------------------------------
 def gather_token_scores(
-    triples: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], k: int
+    triples: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    k: int,
+    plot_per_triple: bool,
+    max_triples: int = 10,
 ) -> Tuple[List[int], List[float]]:
     """
     Build token-level similarity scores.
@@ -128,7 +117,7 @@ def gather_token_scores(
     """
     y_true, y_scores = [], []
 
-    for seq_prefill16, seq_gen16, seq_prefill8 in triples:
+    for i, (seq_prefill16, seq_gen16, seq_prefill8) in enumerate(triples):
         # move to GPU & float32 (fast, deterministic)
         seq_prefill16 = seq_prefill16.float().to(DEVICE, non_blocking=True)
         seq_gen16 = seq_gen16.float().to(DEVICE, non_blocking=True)
@@ -152,6 +141,28 @@ def gather_token_scores(
         pos_scores = -torch.norm(comp_pre - comp_gen, dim=1)  # (seq_len,)
         neg_scores = -torch.norm(comp_pre - comp_pre8, dim=1)
 
+        if plot_per_triple:
+            if i >= max_triples:
+                break
+            plt.figure(figsize=(8, 4))
+            plt.plot(
+                pos_scores.float().cpu().numpy(),
+                label="pos (prefill16 vs gen16)",
+                color="blue",
+            )
+            plt.plot(
+                neg_scores.float().cpu().numpy(),
+                label="neg (prefill16 vs prefill8)",
+                color="red",
+            )
+            plt.title(f"Token Scores for Triple {i + 1} (k={k})")
+            plt.xlabel("Token index")
+            plt.ylabel("Score (-L2 distance)")
+            plt.ylim(-2, 0)
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+
         # extend python lists (detach→cpu to avoid GPU <--> CPU chatter later)
         y_scores.extend(pos_scores.detach().cpu().tolist())
         y_true.extend([1] * len(pos_scores))
@@ -168,18 +179,14 @@ def gather_token_scores(
 def plot_pr_curves(
     k_values: List[int],
     seq_triples: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    plot_per_triple: bool,
 ) -> None:
     plt.figure(figsize=(7, 5))
     for k in k_values:
-        labels, scores = gather_token_scores(seq_triples, k)
+        labels, scores = gather_token_scores(seq_triples, k, plot_per_triple)
         precision, recall, _ = precision_recall_curve(labels, scores)
         pr_auc = auc(recall, precision)
         plt.plot(recall, precision, label=f"k={k} (AUC={pr_auc:.3f})")
-
-        # Enforce monotonic precision for visual clarity
-        # precision_mono = np.maximum.accumulate(precision[::-1])[::-1]
-
-        # plt.step(recall, precision_mono, where="post", label=f"k={k} (AUC={pr_auc:.3f})")
 
     plt.xlabel("Recall")
     plt.ylabel("Precision")
@@ -193,7 +200,27 @@ def plot_pr_curves(
 # Main entry
 # ------------------------------------------------------------
 if __name__ == "__main__":
+    DEVICE = torch.device("cuda")  # ← run on GPU
+    ACTIVATION_DIR = Path("activations")
+    # ACTIVATION_DIR = Path("activations_prefix_longer")
+    FILES = {
+        "prefill16": "16bit_prefill_a.pkl",
+        "gen16": "16bit_generation.pkl",
+        "prefill8": "16bit_prefill_b.pkl",
+    }
+
+    # ACTIVATION_DIR = Path("activations_v2")
+    # FILES = {
+    #     "prefill16": "16bit_prefill.pkl",
+    #     "gen16": "16bit_generation.pkl",
+    #     "prefill8": "8bit_prefill_16bit_tokens.pkl",
+    # }
+    K_VALUES: List[int] = [4, 32, 64, 128, 256]
+    K_VALUES = [32]
+    plot_per_triple = True
+
     data = load_activation_sequences(ACTIVATION_DIR, FILES)
     sequence_triples = list(zip(data["prefill16"], data["gen16"], data["prefill8"]))
-    plot_pr_curves(K_VALUES, sequence_triples)
+
+    plot_pr_curves(K_VALUES, sequence_triples, plot_per_triple)
 # %%
