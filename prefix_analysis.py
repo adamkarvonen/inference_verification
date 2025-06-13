@@ -108,14 +108,19 @@ def gather_token_scores(
     triples: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     k: int,
     plot_per_triple: bool,
-    max_triples: int = 10,
-) -> Tuple[List[int], List[float]]:
+    skip_first_k_tokens: int = 0,
+    compression_type: str = "downproj",
+) -> Tuple[List[int], List[float], List[int], List[float]]:
     """
     Build token-level similarity scores.
     Positive label (1): 16-bit prefill vs 16-bit generation
     Negative label (0): 16-bit prefill vs  8-bit prefill
     """
     y_true, y_scores = [], []
+    sequence_scores, sequence_labels = [], []
+
+    hidden_dim = triples[0][0].size(1)
+    P = make_projection_matrix(hidden_dim, k, DEVICE, dtype=torch.float32, seed=42)
 
     for i, (seq_prefill16, seq_gen16, seq_prefill8) in enumerate(triples):
         # move to GPU & float32 (fast, deterministic)
@@ -123,26 +128,45 @@ def gather_token_scores(
         seq_gen16 = seq_gen16.float().to(DEVICE, non_blocking=True)
         seq_prefill8 = seq_prefill8.float().to(DEVICE, non_blocking=True)
 
-        hidden_dim = seq_prefill16.size(1)
-        P = make_projection_matrix(hidden_dim, k, DEVICE, dtype=torch.float32, seed=42)
+        if compression_type == "topk":
+            # batched compression
+            comp_pre = compress_matrix_topk(seq_prefill16, k)
+            comp_gen = compress_matrix_topk(seq_gen16, k)
+            comp_pre8 = compress_matrix_topk(seq_prefill8, k)
+            # similarity scores for every token
+            pos_scores = batched_negative_l2(comp_pre, comp_gen, hidden_dim)
+            neg_scores = batched_negative_l2(comp_pre, comp_pre8, hidden_dim)
+        elif compression_type == "downproj":
+            comp_pre = compress_matrix_downproj(seq_prefill16, P)
+            comp_gen = compress_matrix_downproj(seq_gen16, P)
+            comp_pre8 = compress_matrix_downproj(seq_prefill8, P)
 
-        # batched compression
-        # comp_pre = compress_matrix_topk(seq_prefill16, k)
-        # comp_gen = compress_matrix_topk(seq_gen16, k)
-        # comp_pre8 = compress_matrix_topk(seq_prefill8, k)
-        # # similarity scores for every token
-        # pos_scores = batched_negative_l2(comp_pre, comp_gen, hidden_dim)
-        # neg_scores = batched_negative_l2(comp_pre, comp_pre8, hidden_dim)
+            pos_scores = -torch.norm(comp_pre - comp_gen, dim=1)  # (seq_len,)
+            neg_scores = -torch.norm(comp_pre - comp_pre8, dim=1)
 
-        comp_pre = compress_matrix_downproj(seq_prefill16, P)
-        comp_gen = compress_matrix_downproj(seq_gen16, P)
-        comp_pre8 = compress_matrix_downproj(seq_prefill8, P)
+        pos_scores = pos_scores[skip_first_k_tokens:]
+        neg_scores = neg_scores[skip_first_k_tokens:]
 
-        pos_scores = -torch.norm(comp_pre - comp_gen, dim=1)  # (seq_len,)
-        neg_scores = -torch.norm(comp_pre - comp_pre8, dim=1)
+        sequence_k = 50
+        pos_sequence_score = (
+            -pos_scores.abs().topk(sequence_k).values.float().mean().item()
+        )
+        neg_sequence_score = (
+            -neg_scores.abs().topk(sequence_k).values.float().mean().item()
+        )
+
+        # print(
+        #     f"Pos sequence score: {pos_sequence_score}, Neg sequence score: {neg_sequence_score}"
+        # )
+
+        sequence_scores.append(pos_sequence_score)
+        sequence_labels.append(1)
+        sequence_scores.append(neg_sequence_score)
+        sequence_labels.append(0)
 
         if plot_per_triple:
-            if i >= max_triples:
+            max_plots = 10
+            if i >= max_plots:
                 break
             plt.figure(figsize=(8, 4))
             plt.plot(
@@ -170,7 +194,7 @@ def gather_token_scores(
         y_scores.extend(neg_scores.detach().cpu().tolist())
         y_true.extend([0] * len(neg_scores))
 
-    return y_true, y_scores
+    return y_true, y_scores, sequence_labels, sequence_scores
 
 
 # ------------------------------------------------------------
@@ -180,19 +204,64 @@ def plot_pr_curves(
     k_values: List[int],
     seq_triples: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     plot_per_triple: bool,
+    skip_first_k_tokens: int,
+    compression_type: str = "downproj",
+    activation_type: str = "Random Prefix",
 ) -> None:
+    image_folder = Path("images")
+    image_folder.mkdir(parents=True, exist_ok=True)
+
     plt.figure(figsize=(7, 5))
     for k in k_values:
-        labels, scores = gather_token_scores(seq_triples, k, plot_per_triple)
+        labels, scores, sequence_labels, sequence_scores = gather_token_scores(
+            seq_triples, k, plot_per_triple, skip_first_k_tokens, compression_type
+        )
         precision, recall, _ = precision_recall_curve(labels, scores)
         pr_auc = auc(recall, precision)
         plt.plot(recall, precision, label=f"k={k} (AUC={pr_auc:.3f})")
 
     plt.xlabel("Recall")
     plt.ylabel("Precision")
-    plt.title("Token-Level Activation Similarity\nPrecision–Recall")
+
+    if compression_type == "topk":
+        hash_title = "TopK"
+    elif compression_type == "downproj":
+        hash_title = "Down Projection"
+
+    plt.title(
+        f"{activation_type} Token-Level Activation Similarity\nPrecision–Recall ({hash_title} Hash)"
+    )
     plt.legend()
     plt.tight_layout()
+
+    activation_file_key = activation_type.lower().replace(" ", "_")
+
+    plt.savefig(
+        image_folder / f"token_pr_curve_{compression_type}_{activation_file_key}.png"
+    )
+
+    plt.show()
+
+    plt.figure(figsize=(7, 5))
+    for k in k_values:
+        labels, scores, sequence_labels, sequence_scores = gather_token_scores(
+            seq_triples, k, plot_per_triple, skip_first_k_tokens, compression_type
+        )
+
+        precision, recall, _ = precision_recall_curve(sequence_labels, sequence_scores)
+        pr_auc = auc(recall, precision)
+        plt.plot(recall, precision, label=f"k={k} (AUC={pr_auc:.3f})")
+
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title(
+        f"{activation_type} Sequence-Level Activation Similarity\nPrecision–Recall ({hash_title} Hash)"
+    )
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(
+        image_folder / f"sequence_pr_curve_{compression_type}_{activation_file_key}.png"
+    )
     plt.show()
 
 
@@ -201,26 +270,39 @@ def plot_pr_curves(
 # ------------------------------------------------------------
 if __name__ == "__main__":
     DEVICE = torch.device("cuda")  # ← run on GPU
-    ACTIVATION_DIR = Path("activations")
+    ACTIVATION_DIR = Path("activations_prefix")
     # ACTIVATION_DIR = Path("activations_prefix_longer")
     FILES = {
         "prefill16": "16bit_prefill_a.pkl",
         "gen16": "16bit_generation.pkl",
         "prefill8": "16bit_prefill_b.pkl",
     }
+    skip_first_k_tokens = 250
+    activation_type = "Random Prefix"
 
-    # ACTIVATION_DIR = Path("activations_v2")
+    # ACTIVATION_DIR = Path("activations_quantize")
     # FILES = {
     #     "prefill16": "16bit_prefill.pkl",
     #     "gen16": "16bit_generation.pkl",
     #     "prefill8": "8bit_prefill_16bit_tokens.pkl",
     # }
-    K_VALUES: List[int] = [4, 32, 64, 128, 256]
-    K_VALUES = [32]
-    plot_per_triple = True
+    # skip_first_k_tokens = 0
+    # activation_type = "Quantized"
+
+    K_VALUES: List[int] = [1, 4, 32, 128, 512]
+    # K_VALUES = [32]
+    # plot_per_triple = True
+    plot_per_triple = False
 
     data = load_activation_sequences(ACTIVATION_DIR, FILES)
     sequence_triples = list(zip(data["prefill16"], data["gen16"], data["prefill8"]))
 
-    plot_pr_curves(K_VALUES, sequence_triples, plot_per_triple)
+    plot_pr_curves(
+        K_VALUES,
+        sequence_triples,
+        plot_per_triple,
+        skip_first_k_tokens,
+        compression_type="downproj",
+        activation_type=activation_type,
+    )
 # %%
