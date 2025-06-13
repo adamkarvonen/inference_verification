@@ -110,6 +110,7 @@ def gather_token_scores(
     plot_per_triple: bool,
     skip_first_k_tokens: int = 0,
     compression_type: str = "downproj",
+    activation_type: str = "Random Prefix",
 ) -> Tuple[List[int], List[float], List[int], List[float]]:
     """
     Build token-level similarity scores.
@@ -185,6 +186,13 @@ def gather_token_scores(
             plt.ylim(-2, 0)
             plt.legend()
             plt.tight_layout()
+
+            os.makedirs("paired_images", exist_ok=True)
+
+            plt.savefig(
+                f"paired_images/token_scores_{compression_type}_{activation_type}_triple_{i + 1}.png"
+            )
+
             plt.show()
 
         # extend python lists (detach→cpu to avoid GPU <--> CPU chatter later)
@@ -211,10 +219,19 @@ def plot_pr_curves(
     image_folder = Path("images")
     image_folder.mkdir(parents=True, exist_ok=True)
 
+    skip_str = ""
+    if skip_first_k_tokens > 0:
+        skip_str = f"\n(skipped first {skip_first_k_tokens} tokens)"
+
     plt.figure(figsize=(7, 5))
     for k in k_values:
         labels, scores, sequence_labels, sequence_scores = gather_token_scores(
-            seq_triples, k, plot_per_triple, skip_first_k_tokens, compression_type
+            seq_triples,
+            k,
+            plot_per_triple,
+            skip_first_k_tokens,
+            compression_type,
+            activation_type,
         )
         precision, recall, _ = precision_recall_curve(labels, scores)
         pr_auc = auc(recall, precision)
@@ -229,7 +246,7 @@ def plot_pr_curves(
         hash_title = "Down Projection"
 
     plt.title(
-        f"{activation_type} Token-Level Activation Similarity\nPrecision–Recall ({hash_title} Hash)"
+        f"{activation_type} Token-Level Activation Similarity\nPrecision–Recall ({hash_title} Hash){skip_str}"
     )
     plt.legend()
     plt.tight_layout()
@@ -237,7 +254,8 @@ def plot_pr_curves(
     activation_file_key = activation_type.lower().replace(" ", "_")
 
     plt.savefig(
-        image_folder / f"token_pr_curve_{compression_type}_{activation_file_key}.png"
+        image_folder
+        / f"token_pr_curve_{compression_type}_{activation_file_key}_skip_{skip_first_k_tokens}.png"
     )
 
     plt.show()
@@ -245,7 +263,12 @@ def plot_pr_curves(
     plt.figure(figsize=(7, 5))
     for k in k_values:
         labels, scores, sequence_labels, sequence_scores = gather_token_scores(
-            seq_triples, k, plot_per_triple, skip_first_k_tokens, compression_type
+            seq_triples,
+            k,
+            plot_per_triple,
+            skip_first_k_tokens,
+            compression_type,
+            activation_type,
         )
 
         precision, recall, _ = precision_recall_curve(sequence_labels, sequence_scores)
@@ -255,12 +278,13 @@ def plot_pr_curves(
     plt.xlabel("Recall")
     plt.ylabel("Precision")
     plt.title(
-        f"{activation_type} Sequence-Level Activation Similarity\nPrecision–Recall ({hash_title} Hash)"
+        f"{activation_type} Sequence-Level Activation Similarity\nPrecision–Recall ({hash_title} Hash){skip_str}"
     )
     plt.legend()
     plt.tight_layout()
     plt.savefig(
-        image_folder / f"sequence_pr_curve_{compression_type}_{activation_file_key}.png"
+        image_folder
+        / f"sequence_pr_curve_{compression_type}_{activation_file_key}_skip_{skip_first_k_tokens}.png"
     )
     plt.show()
 
@@ -277,7 +301,8 @@ if __name__ == "__main__":
         "gen16": "16bit_generation.pkl",
         "prefill8": "16bit_prefill_b.pkl",
     }
-    skip_first_k_tokens = 250
+    # prefill_skip_tokens = [0, 50, 250, 500]
+    prefill_skip_tokens = [50]
     activation_type = "Random Prefix"
 
     # ACTIVATION_DIR = Path("activations_quantize")
@@ -286,23 +311,27 @@ if __name__ == "__main__":
     #     "gen16": "16bit_generation.pkl",
     #     "prefill8": "8bit_prefill_16bit_tokens.pkl",
     # }
-    # skip_first_k_tokens = 0
+    # prefill_skip_tokens = [0]
     # activation_type = "Quantized"
 
     K_VALUES: List[int] = [1, 4, 32, 128, 512]
-    # K_VALUES = [32]
-    # plot_per_triple = True
-    plot_per_triple = False
+    K_VALUES = [32]
+    plot_per_triple = True
+    # plot_per_triple = False
+
+    compression_type = "downproj"
+    # compression_type = "topk"
 
     data = load_activation_sequences(ACTIVATION_DIR, FILES)
     sequence_triples = list(zip(data["prefill16"], data["gen16"], data["prefill8"]))
 
-    plot_pr_curves(
-        K_VALUES,
-        sequence_triples,
-        plot_per_triple,
-        skip_first_k_tokens,
-        compression_type="downproj",
-        activation_type=activation_type,
-    )
+    for skip_first_k_tokens in prefill_skip_tokens:
+        plot_pr_curves(
+            K_VALUES,
+            sequence_triples,
+            plot_per_triple,
+            skip_first_k_tokens,
+            compression_type=compression_type,
+            activation_type=activation_type,
+        )
 # %%
